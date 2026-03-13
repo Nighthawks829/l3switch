@@ -14,6 +14,7 @@ class L3Switch(app_manager.RyuApp):
     def __init__(self, *_args, **_kwargs):
         super(L3Switch, self).__init__(*_args, **_kwargs)
         self.mac_to_port = {}
+        self.ip_to_mac = {}
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -26,6 +27,59 @@ class L3Switch(app_manager.RyuApp):
             parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)
         ]
         self.add_flow(datapath, 0, match, actions)
+
+        req = parser.OFPPortDescStatsRequest(datapath, 0)
+        datapath.send_msg(req)
+        self.logger.info("Sent OFPPortDescStatsRequest to switch dpid=%s", datapath.id)
+
+    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
+    def port_desc_stats_reply_handler(self, ev):
+        self.logger.info(ev.msg.body)
+        datapath = ev.msg.datapath
+        dpid = datapath.id
+
+        # Initialize dictionary if needed
+        if not hasattr(self, "ip_to_mac"):
+            self.ip_to_mac = {}
+
+        # Hardcoded IPs per port for this switch
+        switch_port_ip = {
+            1: "192.168.1.1",  # port 1 → IP 192.168.1.1
+            2: "192.168.2.1",  # port 2 → IP 192.168.2.1
+        }
+
+        self.ip_to_mac.setdefault(dpid, {})
+
+        self.logger.info("---- Switch %s Port Information ----", dpid)
+        for p in ev.msg.body:
+            if p.port_no == datapath.ofproto.OFPP_LOCAL:
+                continue
+            port_no = p.port_no
+            name = p.name.decode("utf-8")
+            mac = p.hw_addr
+            state = p.state
+            curr_speed = p.curr_speed
+            max_speed = p.max_speed
+
+            self.logger.info(
+                "DPID=%s | Port=%s | Name=%s | MAC=%s | State=%s | Speed=%s Mbps",
+                dpid,
+                port_no,
+                name,
+                mac,
+                state,
+                curr_speed,
+            )
+
+            if port_no in switch_port_ip:
+                ip = switch_port_ip[port_no]
+                mac = mac
+                self.ip_to_mac[dpid][ip] = mac
+                self.logger.info(
+                    "Switch %s Port %s: IP=%s MAC=%s", dpid, port_no, ip, mac
+                )
+
+            self.logger.info(self.ip_to_mac)
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
