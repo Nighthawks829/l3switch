@@ -6,6 +6,8 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
+from ryu.lib.packet import in_proto
+from ryu.lib.packet import arp
 
 
 class L3Switch(app_manager.RyuApp):
@@ -110,6 +112,65 @@ class L3Switch(app_manager.RyuApp):
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
+        arp_pkt = pkt.get_protocol(arp.arp)
+
+        # self.logger.info("ETH %s",eth)
+        # if arp_pkt:
+        #     self.logger.info(arp_pkt)
+        #     self.logger.info(
+        #         "ARP Packet received: %s -> %s (target IP %s)",
+        #         arp_pkt.src_ip,
+        #         arp_pkt.dst_ip,
+        #         arp_pkt.dst_ip,
+        #     )
+        # # Here you can handle ARP reply
+        # else:
+        #     self.logger.debug("Not an ARP packet, ignoring")
+        # if eth.ethertype==ether_types.ETH_TYPE_ARP:
+        #     self.logger.info("%s",)
+
+        if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST:
+            target_ip = arp_pkt.dst_ip
+            dpid = datapath.id
+
+            if dpid in self.ip_to_mac and target_ip in self.ip_to_mac[dpid]:
+                mac_to_reply = self.ip_to_mac[dpid][target_ip]
+                src_mac = mac_to_reply
+
+                # Build ARP Reply
+                arp_reply_pkt = packet.Packet()
+                arp_reply_pkt.add_protocol(
+                    ethernet.ethernet(ethertype=eth.ethertype, dst=eth.src, src=src_mac)
+                )
+
+                arp_reply_pkt.add_protocol(
+                    arp.arp(
+                        opcode=arp.ARP_REPLY,
+                        src_mac=src_mac,
+                        src_ip=target_ip,
+                        dst_mac=arp_pkt.src_mac,
+                        dst_ip=arp_pkt.src_ip,
+                    )
+                )
+
+                arp_reply_pkt.serialize()
+
+                actions = [parser.OFPActionOutput(in_port)]
+                out = parser.OFPPacketOut(
+                    datapath=datapath,
+                    buffer_id=ofproto.OFP_NO_BUFFER,
+                    in_port=ofproto.OFPP_CONTROLLER,
+                    actions=actions,
+                    data=arp_reply_pkt.data,
+                )
+                datapath.send_msg(out)
+
+                self.logger.info(
+                    "Sent ARP reply: IP=%s MAC=%s to port %s",
+                    target_ip,
+                    mac_to_reply,
+                    in_port,
+                )
 
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             return
