@@ -8,6 +8,8 @@ from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
 from ryu.lib.packet import in_proto
 from ryu.lib.packet import arp
+from ryu.lib.packet import ipv4
+from ryu.lib.packet import icmp
 
 
 class L3Switch(app_manager.RyuApp):
@@ -129,6 +131,7 @@ class L3Switch(app_manager.RyuApp):
         # if eth.ethertype==ether_types.ETH_TYPE_ARP:
         #     self.logger.info("%s",)
 
+        # Handle ARP requests
         if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST:
             target_ip = arp_pkt.dst_ip
             dpid = datapath.id
@@ -169,6 +172,57 @@ class L3Switch(app_manager.RyuApp):
                     "Sent ARP reply: IP=%s MAC=%s to port %s",
                     target_ip,
                     mac_to_reply,
+                    in_port,
+                )
+
+        # Handle ICMP Echo requests (ping)
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+        icmp_pkt = pkt.get_protocol(icmp.icmp)
+
+        if ip_pkt and icmp_pkt and icmp_pkt.type == icmp.ICMP_ECHO_REQUEST:
+            # self.logger.info("IP: %s", ip_pkt)
+            # self.logger.info("ICMP: %s", icmp_pkt)
+            dpid = datapath.id
+            dst_ip = ip_pkt.dst
+            if dpid in self.ip_to_mac and dst_ip in self.ip_to_mac[dpid]:
+                src_mac = self.ip_to_mac[dpid][dst_ip]
+
+                # Build ICMP Echo Reply
+                icmp_reply = packet.Packet()
+                icmp_reply.add_protocol(
+                    ethernet.ethernet(
+                        ethertype=eth.ethertype, src=src_mac, dst=eth.src
+                    )
+                )
+
+                icmp_reply.add_protocol(
+                    ipv4.ipv4(dst=ip_pkt.src, src=dst_ip, proto=ip_pkt.proto)
+                )
+
+                icmp_reply.add_protocol(
+                    icmp.icmp(
+                        type_=icmp.ICMP_ECHO_REPLY,
+                        code=0,
+                        csum=0,
+                        data=icmp_pkt.data,
+                    )
+                )
+
+                icmp_reply.serialize()
+
+                actions = [parser.OFPActionOutput(in_port)]
+                out = parser.OFPPacketOut(
+                    datapath=datapath,
+                    buffer_id=ofproto.OFP_NO_BUFFER,
+                    in_port=ofproto.OFPP_CONTROLLER,
+                    actions=actions,
+                    data=icmp_reply.data,
+                )
+                datapath.send_msg(out)
+                self.logger.info(
+                    "Sent ICMP reply: IP=%s to %s on port %s",
+                    dst_ip,
+                    ip_pkt.src,
                     in_port,
                 )
 
