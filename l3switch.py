@@ -10,6 +10,8 @@ from ryu.lib.packet import in_proto
 from ryu.lib.packet import arp
 from ryu.lib.packet import ipv4
 from ryu.lib.packet import icmp
+import subprocess
+import ipaddress
 
 
 class L3Switch(app_manager.RyuApp):
@@ -19,18 +21,128 @@ class L3Switch(app_manager.RyuApp):
         super(L3Switch, self).__init__(*_args, **_kwargs)
         self.mac_to_port = {}
         self.ip_to_mac = {}
+        self.port_to_ip = {}
+        self.route_table = {}
+
+    # Run the subprocess to get the IP address for each OpenVSwitch Interface
+    def get_switch_ips(self, switch_name):
+        ip_dict = {}
+
+        result = subprocess.run(
+            ["ip", "-o", "-f", "inet", "addr", "show"],
+            capture_output=True,
+            text=True,
+        )
+
+        for line in result.stdout.splitlines():
+            parts = line.split()
+
+            iface = parts[1]  # s1-eth1
+            if not iface.startswith(f"{switch_name}-eth"):
+                continue
+
+            ip_prefix = parts[3]  # 192.168.1.1/24
+            ip_intf = ipaddress.IPv4Interface(ip_prefix)
+
+            # self.logger.info("IP Intf: %s", ip_intf)
+            self.logger.info(ip_prefix)
+
+            ip_dict[iface] = {
+                "ip": str(ip_intf.ip),
+                "netmask": str(ip_intf.netmask),
+                "network": str(ip_intf.network.network_address),
+                "prefixlen": ip_intf.network.prefixlen,
+            }
+
+        return ip_dict
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
+        dpid = datapath.id
 
+        self.logger.info("Switch %s connected", dpid)
+
+        switch_ips = self.get_switch_ips(f"s{dpid}")
+        self.logger.info("Switch %s IPs: %s", dpid, switch_ips)
+
+        # Build the Port to IP Table
+        self.port_to_ip.setdefault(dpid, {})
+
+        for iface, data in switch_ips.items():
+            ip = data["ip"]
+
+            # Extract port number from interface name (s1-eth1 → 1)
+            port_no = int(iface.split("eth")[1])
+
+            self.port_to_ip[dpid][port_no] = ip
+
+            self.logger.info("Mapped DPID=%s Port=%s -> IP=%s", dpid, port_no, ip)
+
+        self.logger.info("Port to IP: %s", self.port_to_ip)
+
+        # Build Route Table
+        self.route_table.setdefault(dpid, [])
+
+        for iface, data in switch_ips.items():
+            network = data["network"]
+            netmask = data["netmask"]
+            prefixlen = data["prefixlen"]
+
+            port_no = int(iface.split("eth")[1])
+
+            route_entry = {
+                "network": network,
+                "netmask": netmask,
+                "prefixlen": prefixlen,
+                "port": port_no,
+            }
+
+            self.route_table[dpid].append(route_entry)
+
+            self.logger.info(
+                "Route added: %s/%s -> port %s", network, prefixlen, port_no
+            )
+
+        self.logger.info("Route Table: %s", self.route_table)
+
+        # Build Broadcast Flow
         match = parser.OFPMatch()
         actions = [
             parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)
         ]
         self.add_flow(datapath, 0, match, actions)
+
+        # Build Route Table Flow
+
+        # for route in self.route_table[dpid]:
+        #     network = route["network"]
+        #     netmask = route["netmask"]
+        #     port = route["port"]
+
+        #     match = parser.OFPMatch(eth_type=0x0800, ipv4_dst=(network, netmask))
+
+        #     actions = [parser.OFPActionOutput(port)]
+
+        #     inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+
+        #     mod = parser.OFPFlowMod(
+        #         datapath=datapath,
+        #         priority=100,
+        #         match=match,
+        #         instructions=inst,
+        #     )
+
+        #     self.add_flow(datapath, priority=100, match=match, actions=actions)
+
+        #     self.logger.info(
+        #         "Installed route: %s/%s -> port %s",
+        #         network,
+        #         route["prefixlen"],
+        #         port,
+        #     )
 
         req = parser.OFPPortDescStatsRequest(datapath, 0)
         datapath.send_msg(req)
@@ -47,10 +159,10 @@ class L3Switch(app_manager.RyuApp):
             self.ip_to_mac = {}
 
         # Hardcoded IPs per port for this switch
-        switch_port_ip = {
-            1: "192.168.1.1",  # port 1 → IP 192.168.1.1
-            2: "192.168.2.1",  # port 2 → IP 192.168.2.1
-        }
+        # switch_port_ip = {
+        #     1: "192.168.1.1",  # port 1 → IP 192.168.1.1
+        #     2: "192.168.2.1",  # port 2 → IP 192.168.2.1
+        # }
 
         self.ip_to_mac.setdefault(dpid, {})
 
@@ -75,9 +187,8 @@ class L3Switch(app_manager.RyuApp):
                 curr_speed,
             )
 
-            if port_no in switch_port_ip:
-                ip = switch_port_ip[port_no]
-                mac = mac
+            if dpid in self.port_to_ip and port_no in self.port_to_ip[dpid]:
+                ip = self.port_to_ip[dpid][port_no]
                 self.ip_to_mac[dpid][ip] = mac
                 self.logger.info(
                     "Switch %s Port %s: IP=%s MAC=%s", dpid, port_no, ip, mac
@@ -190,9 +301,7 @@ class L3Switch(app_manager.RyuApp):
                 # Build ICMP Echo Reply
                 icmp_reply = packet.Packet()
                 icmp_reply.add_protocol(
-                    ethernet.ethernet(
-                        ethertype=eth.ethertype, src=src_mac, dst=eth.src
-                    )
+                    ethernet.ethernet(ethertype=eth.ethertype, src=src_mac, dst=eth.src)
                 )
 
                 icmp_reply.add_protocol(
