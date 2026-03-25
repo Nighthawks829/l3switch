@@ -8,3 +8,5 @@ sudo mn --controller=remote,ip=127.0.0.1 --mac -i 10.1.1.0/24 --switch=ovsk,prot
 
 46:55:ed:ea:71:cc
 fe:fd:e8:6d:1a:45
+
+sudo tcpdump -i s1-eth1 -w "$(date +%Y%m%d-%H%M%S).pcap"
